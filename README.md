@@ -1,21 +1,31 @@
-# M5Stack LLM Module + StackFlow `llm_framework` セットアップ手順（Qwen2.5-0.5B + Soft-Prefix 注入）
+# BI_M5_QwenSoftPrefix — M5Stack LLM Module（StackFlow `llm_framework`）セットアップ手順  
+（Gitで管理 → `scp`で `main.cpp` / `LLM.hpp` を転送 → ビルド → Macから動作検証）
 
-この README は、M5Stack LLM Module 上で `StackFlow/projects/llm_framework` をビルド・起動し、**Soft-Prefix（prefix 埋め込み）を入力埋め込みの先頭に合成する方式**で注入しつつ、Mac から動作検証するまでの手順をまとめたものです。
+この README は、M5Stack LLM Module（AX650/AX630系）上の `StackFlow/projects/llm_framework` を対象に、
 
-> 重要（結論）
-> - **ストリーム出力（`llm.utf-8.stream`）は途中で止まるケースがある**ため、まずは **非ストリーム出力（`llm.utf-8`）**で検証します。
-> - `setup` が `unit call false (-9)` の場合は **LLMユニット（`llm_llm-*`）が見つからない／起動できない（依存ライブラリ不整合）**の可能性が濃厚です。
-> - `ldd` で `GLIBCXX_3.4.30 not found` などが出る場合は、**M5Stack 側の libstdc++ の参照先修正**が必要です。
+- **Mac側で Git 管理**（差分が追える）
+- **Mac → M5Stackへ `scp` で `main.cpp` / `LLM.hpp` を安全に置き換え**
+- **M5Stack側で `scons` ビルド**
+- **Mac側からソケットAPIで動作検証（非ストリーム推奨）**
+- **Soft-Prefix（bf16ベクトル）注入の比較検証**
+
+までを、最初から最後まで「手順通りに打てる」形でまとめたものです。
 
 ---
 
 ## 0. 前提
 
-- M5Stack LLM Module に SSH で入れること
-- `llm-sys` が起動して TCP **10001** を listen していること
-- モデルは例として `qwen2.5-0.5B-prefill-20e` を使用（適宜置き換え）
+- Mac（ローカル）に `git`, `python3`, `ssh`, `scp` がある
+- M5Stackに `root` で SSH 接続できる（`$M5_HOST` で参照）
+- M5Stack で `llm-sys` が `10001/tcp` を listen している
 
-### 0.1 `llm-sys` 稼働確認
+### 0.1 接続先を環境変数に入れる（Mac）
+
+```bash
+export M5_HOST="root@192.168.3.132"   # ←あなたのM5のIPに合わせる
+```
+
+### 0.2 llm-sys 稼働確認（Mac→SSH）
 
 ```bash
 ssh $M5_HOST '
@@ -27,43 +37,161 @@ ss -lntp | grep ":10001" || true
 
 ---
 
-## 1. ビルド（`llm_framework`）
+## 1. Git リポジトリを作る（Mac）
 
-### 1.1 ルートへ移動
+### 1.1 作業ディレクトリ作成 & 初期化
 
 ```bash
-ssh $M5_HOST 'cd /root/StackFlow/projects/llm_framework && pwd'
+mkdir -p ~/CODES/BI_M5_QwenSoftPrefix
+cd ~/CODES/BI_M5_QwenSoftPrefix
+
+git init
 ```
 
-### 1.2 （必要なら）`simdjson_component` の `GCC_DUMPMACHINE` KeyError を回避
+### 1.2 このリポジトリの推奨構成
+
+```
+BI_M5_QwenSoftPrefix/
+  README.md
+  patched/
+    main.cpp
+    LLM.hpp
+  scripts/
+    client_baseline_nostream.py
+    client_two_infer_nostream.py
+    compare_baseline_vs_softprefix_nostream.py
+```
+
+> `patched/` に「M5へ転送する最終版」を置いておくのが運用上ラクです（現在どれを使っているか迷子にならない）。
+
+---
+
+## 2. M5Stackから “現状ファイル” を取ってコミット（最重要）
+
+まず **現状（動いている状態）をローカルに回収してGitで保存**します。  
+これがあると、何か壊しても **いつでも即ロールバック**できます。
+
+### 2.1 M5Stack上の対象パス
+
+- `main.cpp`：`/root/StackFlow/projects/llm_framework/main_llm/src/main.cpp`
+- `LLM.hpp`：`/root/StackFlow/projects/llm_framework/main_llm/src/runner/LLM.hpp`
+
+### 2.2 `scp` で回収（Mac）
+
+```bash
+mkdir -p patched/original
+
+scp $M5_HOST:/root/StackFlow/projects/llm_framework/main_llm/src/main.cpp patched/original/main.cpp
+scp $M5_HOST:/root/StackFlow/projects/llm_framework/main_llm/src/runner/LLM.hpp patched/original/LLM.hpp
+```
+
+### 2.3 “オリジナル”をコミット
+
+```bash
+git add patched/original/main.cpp patched/original/LLM.hpp
+git commit -m "backup: original main.cpp and LLM.hpp from device"
+```
+
+---
+
+## 3. 変更（パッチ）を作る／反映する（Mac）
+
+あなたが編集するのは基本この2つです：
+
+- `patched/main.cpp`
+- `patched/LLM.hpp`
+
+> ここに「Soft-Prefix注入」「2回目タイムアウト対策（prefill入力の完全初期化）」などの修正を入れます。
+
+### 3.1 “2回目以降にタイムアウトする”対策（重要）
+
+症状：再起動後は1回目OKだが、2回目同じ推論を投げると止まる。  
+原因候補：**prefill固定長入力の未初期化領域が前回の値を引きずる**。
+
+修正方針（`LLM.hpp`）：
+
+- `Run(test_embed)` の prefill入力を毎回 `prefill_token_num * H` へ `resize(..., 0)` で **ゼロ埋め**
+- `indices` を `0..prefill_token_num-1` まで必ず **全要素埋め**
+
+> これで「2回目だけハング/超遅延」が改善するケースが多いです。
+
+### 3.2 編集したらコミット
+
+```bash
+# 例：編集後に
+git add patched/main.cpp patched/LLM.hpp
+git commit -m "feat: soft-prefix injection + fix 2nd-run timeout (prefill input init)"
+```
+
+### 3.3 GitHubへ上げる（任意）
+
+```bash
+git remote add origin git@github.com:YOUR_NAME/BI_M5_QwenSoftPrefix.git
+git branch -M main
+git push -u origin main
+```
+
+---
+
+## 4. Mac → M5Stackへ `scp` で転送して置き換え（安全手順）
+
+**直接上書きは避け**、まず `/tmp` に転送してから、M5上でバックアップしつつ入れ替えます。
+
+### 4.1 転送（Mac）
+
+```bash
+scp patched/main.cpp $M5_HOST:/tmp/main.cpp.new
+scp patched/LLM.hpp  $M5_HOST:/tmp/LLM.hpp.new
+```
+
+### 4.2 バックアップ & 置換（M5側）
+
+```bash
+ssh $M5_HOST '
+set -e
+PROJ=/root/StackFlow/projects/llm_framework
+TS=$(date +%Y%m%d_%H%M%S)
+
+# backup
+cp -a $PROJ/main_llm/src/main.cpp $PROJ/main_llm/src/main.cpp.bak_$TS
+cp -a $PROJ/main_llm/src/runner/LLM.hpp $PROJ/main_llm/src/runner/LLM.hpp.bak_$TS
+
+# replace
+install -m 644 /tmp/main.cpp.new $PROJ/main_llm/src/main.cpp
+install -m 644 /tmp/LLM.hpp.new  $PROJ/main_llm/src/runner/LLM.hpp
+
+echo "replaced OK"
+ls -lh $PROJ/main_llm/src/main.cpp $PROJ/main_llm/src/runner/LLM.hpp
+'
+```
+
+---
+
+## 5. M5Stack側でビルド（`scons`）
+
+### 5.1 `simdjson_component` の `GCC_DUMPMACHINE` KeyError が出る場合（初回だけ）
 
 エラー例：
-
 ```
 KeyError: 'GCC_DUMPMACHINE'
-.../simdjson_component/SConstruct: gcc_dumpmachine = env["GCC_DUMPMACHINE"].split("-")
+... simdjson_component/SConstruct ...
 ```
 
-対処（安全に差し込み）：
+パッチ（M5側で実行）：
 
 ```bash
 ssh $M5_HOST 'python3 -' <<'PY'
 from pathlib import Path
-
 p = Path("/root/StackFlow/SDK/components/simdjson_component/SConstruct")
 txt = p.read_text()
-
 needle = 'gcc_dumpmachine = env["GCC_DUMPMACHINE"].split("-")'
-if needle not in txt:
-    print("Pattern not found. Please locate GCC_DUMPMACHINE usage manually.")
-    raise SystemExit(1)
-
 marker = "ensure GCC_DUMPMACHINE exists even if SCons GCC tool could not populate it"
+if needle not in txt:
+    raise SystemExit("Pattern not found.")
 if marker in txt:
     print("Already patched.")
     raise SystemExit(0)
-
-patch_lines = [
+patch = "\n".join([
     "# ensure GCC_DUMPMACHINE exists even if SCons GCC tool could not populate it",
     "import subprocess",
     "if \"GCC_DUMPMACHINE\" not in env:",
@@ -74,62 +202,48 @@ patch_lines = [
     "        dm = \"aarch64-linux-gnu\"",
     "    env[\"GCC_DUMPMACHINE\"] = dm",
     "",
-]
-patch = "\n".join(patch_lines)
-
+])
 txt = txt.replace(needle, patch + "\n" + needle)
 p.write_text(txt)
 print("Patched:", p)
 PY
 ```
 
----
+### 5.2 SCons が “存在しないクロスコンパイラ” を呼ぶ場合（初回だけ）
 
-### 1.3 （必要なら）SCons が参照するクロスツールチェーンの “ダミーラッパー” を作る
-
-SCons が以下のような **存在しないクロスコンパイラ**を呼びに行くことがあります：
-
+例：
 ```
-/opt/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++
+/opt/gcc-arm-10.3.../aarch64-none-linux-gnu-g++: No such file or directory
 ```
 
-M5Stack（aarch64 実機）では、そのパスに **ネイティブ gcc/g++ を呼ぶラッパー**を置くのが最短です。
+M5は aarch64 実機なので、そこに **gcc/g++ラッパー**を置きます：
 
 ```bash
 ssh $M5_HOST '
 set -e
 TC=/opt/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin
 PREFIX=aarch64-none-linux-gnu
-
 mkdir -p "$TC"
 cd "$TC"
-
 cat > ${PREFIX}-gcc << "SH"
 #!/bin/sh
 exec /usr/bin/gcc "$@"
 SH
-
 cat > ${PREFIX}-g++ << "SH"
 #!/bin/sh
 exec /usr/bin/g++ "$@"
 SH
-
 chmod +x ${PREFIX}-gcc ${PREFIX}-g++
-
-# binutils系（必要になることがある）
 for t in ar ranlib strip nm ld objcopy objdump; do
   if command -v $t >/dev/null 2>&1; then
     ln -sf "$(command -v $t)" "${PREFIX}-${t}"
   fi
 done
+echo "wrappers installed"
 '
 ```
 
----
-
-### 1.4 ビルド（OOM回避のため `-j1` 推奨）
-
-ビルド中にダウンロード確認（Y/N）が出るため、`yes Y |` で全て自動承諾します。
+### 5.3 ビルド（OOM回避で `-j1` 推奨）
 
 ```bash
 ssh $M5_HOST '
@@ -142,54 +256,45 @@ yes Y | scons -j1
 
 ---
 
-## 2. `setup` が `unit call false (-9)` の場合（最重要トラブルシュート）
+## 6. 生成物（`llm_llm-*`）を導入して依存関係チェック
 
-### 2.1 症状
-
-クライアントの `setup` 応答が以下になる：
-
-```json
-{"error":{"code":-9,"message":"unit call false"}}
-```
-
-これは多くの場合、**LLMユニット（`llm_llm-*`）が起動できない**（= 依存ライブラリが足りない/ABI不整合）ことが原因です。
-
-### 2.2 まず `ldd` で依存関係を確認
+### 6.1 生成物を /opt/m5stack/bin へ
 
 ```bash
 ssh $M5_HOST '
 set -e
-ldd /opt/m5stack/bin/llm_llm-1.9 | egrep "GLIBCXX|CXXABI|not found" || echo OK
+NEW=/root/StackFlow/projects/llm_framework/build/llm_llm-1.8/llm_llm-1.8
+DEST=/opt/m5stack/bin/llm_llm-1.8
+TS=$(date +%Y%m%d_%H%M%S)
+
+ls -lh "$NEW"
+
+if [ -f "$DEST" ]; then
+  cp "$DEST" "$DEST.bak_$TS"
+fi
+install -m 755 "$NEW" "$DEST"
+
+ln -sfn "$DEST" /opt/m5stack/bin/llm_llm
+ln -sfn "$DEST" /opt/m5stack/bin/llm-llm
+
+echo "installed:"
+ls -lh /opt/m5stack/bin/llm_llm /opt/m5stack/bin/llm-llm /opt/m5stack/bin/llm_llm-1.8
 '
 ```
 
-よくある失敗：
-- `GLIBCXX_3.4.30 not found`
-- `CXXABI_1.3.13 not found`
-- `libax_interpreter.so => not found`
-
----
-
-## 3. 依存関係（libstdc++）の修復：`GLIBCXX_3.4.30 not found` 対策
-
-### 3.1 システム側に正しい libstdc++ があるか確認
-
-Ubuntu 22.04 の場合、多くはここにあります：
-
-- `/usr/lib/aarch64-linux-gnu/libstdc++.so.6`（`GLIBCXX_3.4.30` を含む）
-
-確認：
+### 6.2 `ldd` で “not found / GLIBCXX” を潰す
 
 ```bash
 ssh $M5_HOST '
 set -e
-strings /usr/lib/aarch64-linux-gnu/libstdc++.so.6 | egrep "GLIBCXX_3.4.30|CXXABI_1.3.13" | head
+ldd /opt/m5stack/bin/llm_llm-1.8 | egrep "not found|GLIBCXX|CXXABI" || echo "OK"
 '
 ```
 
-### 3.2 M5Stack 独自パス側（例：`/usr/local/m5stack/lib/gcc-10.3/`）を壊さずに直す
+#### 6.2.1 `GLIBCXX_3.4.30 not found` が出る場合（例）
 
-`cp -a` で symlink をコピーすると **壊れたリンク**になることがあるため、以下のように **絶対パス symlink を貼り直す**のが安全です。
+M5独自の `libstdc++.so.6` が古い/壊れている可能性があるため、  
+**システム側（Ubuntu）の libstdc++ を参照する symlink に貼り替え**ます。
 
 ```bash
 ssh $M5_HOST '
@@ -198,25 +303,20 @@ DIR=/usr/local/m5stack/lib/gcc-10.3
 cd "$DIR"
 TS=$(date +%Y%m%d_%H%M%S)
 
-# 既存（壊れている可能性あり）を退避
 if [ -L libstdc++.so.6 ] || [ -e libstdc++.so.6 ]; then
   mv -f libstdc++.so.6 "libstdc++.so.6.broken_$TS" || true
 fi
 
-# システム側へ向ける
 ln -sfn /usr/lib/aarch64-linux-gnu/libstdc++.so.6 libstdc++.so.6
 
-# 確認
 ls -l libstdc++.so.6*
 strings -a libstdc++.so.6 | egrep "GLIBCXX_3.4.30|CXXABI_1.3.13" | head -n 5
 '
 ```
 
----
+#### 6.2.2 `libax_interpreter.so => not found` が出る場合
 
-## 4. 依存関係（Axera runtime）修復：`libax_interpreter.so not found` 対策
-
-### 4.1 まず場所を探す
+まず場所を探す：
 
 ```bash
 ssh $M5_HOST '
@@ -225,16 +325,13 @@ find /opt /usr/local/m5stack /usr/lib -name "libax_interpreter.so*" 2>/dev/null 
 '
 ```
 
-### 4.2 見つかったディレクトリを `ldconfig` に登録
-
-例：`/usr/local/m5stack/lib/ax-lib` にあった場合
+見つかったディレクトリ（例：`/usr/local/m5stack/lib/ax-lib`）を `ldconfig` へ登録：
 
 ```bash
 ssh $M5_HOST '
 set -e
 DIR=/usr/local/m5stack/lib/ax-lib
 ls -l "$DIR"/libax_interpreter.so* >/dev/null
-
 echo "$DIR" > /etc/ld.so.conf.d/m5stack-ax.conf
 ldconfig
 ldconfig -p | grep -i ax_interpreter || true
@@ -243,91 +340,75 @@ ldconfig -p | grep -i ax_interpreter || true
 
 ---
 
-## 5. baseline 動作確認（非ストリーム）
-
-ストリーム出力は途中で止まるケースがあったため、まずは **非ストリーム**で確認します。
-
-### 5.1 baseline（non-stream）確認（例）
-
-- `response_format: "llm.utf-8"`
-- `object: "llm.utf-8"`
-
-を使い、推論結果を 1発で返します。
-
-> 会話ログ上、この方法では **最後まで応答が返る**ことを確認済みです。
-
----
-
-## 6. Soft-Prefix 注入（非ストリーム出力で比較）
-
-### 6.1 なぜ “入力は stream、出力は non-stream” なのか
-
-- 出力ストリーム（`llm.utf-8.stream`）が途中停止することがある
-- Soft-Prefix を JSON `data` 内に同梱するため、入力は `llm.utf-8.stream` 形式（`delta/index/finish`）を使うのが都合が良い
-- 出力は `llm.utf-8` にして、最終結果を 1回で受け取る
-
-### 6.2 Soft-Prefix 形式（本READMEでの前提）
-
-- `soft_prefix.len = P`（prefix token 数）
-- `soft_prefix.data_b64` は **bf16(u16 little-endian)** の配列を base64 したもの
-- 要素数は **`P * H`**
-  - `P` = prefix token 数（例：1）
-  - `H` = `tokens_embed_size`（例：896。モデル設定に依存）
-
-### 6.3 baseline vs soft_prefix 比較スクリプト（非ストリーム出力）
-
-このリポジトリに含める想定の比較スクリプト例：
-
-- `compare_baseline_vs_softprefix_nostream.py`
-
-機能：
-- baseline（prefixなし）を1回実行して保存
-- prefixあり（val=小→大）を複数回実行
-- 類似度/差分（先頭）/全文（JSON）を保存
-
----
-
-## 7. モデルの `tokens_embed_size (H)` を確認する
-
-環境例ではモデルJSONが以下にありました：
-
-- `/opt/m5stack/data/models/mode_qwen2.5-0.5B-prefill-20e.json`
-- `/opt/m5stack/data/qwen2.5-0.5B-prefill-20e/qwen2.5-0.5B-prefill-20e.json`
-
-確認コマンド例：
+## 7. サービス再起動
 
 ```bash
 ssh $M5_HOST '
 set -e
-grep -n ""tokens_embed_size"" /opt/m5stack/data/models/mode_qwen2.5-0.5B-prefill-20e.json | head -n 5 || true
+systemctl restart llm-sys
+sleep 1
+ss -lntp | grep ":10001" || true
 '
 ```
 
 ---
 
-## 8. よくあるエラーと対処まとめ
+## 8. Macから動作検証（非ストリーム推奨）
 
-### 8.1 `unit call false (-9)`
-- LLMユニットが起動できていない（依存関係）
-- `ldd /opt/m5stack/bin/llm_llm-*` を確認し、`GLIBCXX`/`libax_interpreter` を解消
+ストリーム（`llm.utf-8.stream`）は途中停止するケースがあるため、まず **非ストリーム**で通します。
 
-### 8.2 `inference data push false (-4)`
-- setup が失敗してタスクが無い／入力形式が合っていないケースで出やすい
-- まず `setup` を code=0 にする（依存関係の解消が前提）
+### 8.1 baseline（非ストリーム）
 
-### 8.3 ストリーム出力が途中で止まる
-- 非ストリーム（`llm.utf-8`）で検証する
-- ストリームを直す場合は、LLM側の callback/decode頻度・tokenizer 経路の見直しが必要
+`scripts/client_baseline_nostream.py` を用意して実行します。
+
+チェックポイント：
+- `setup` の `error.code == 0`
+- `inference` の応答が **1回で返る**
+
+### 8.2 “2回連続推論”で再現しないか確認（重要）
+
+`scripts/client_two_infer_nostream.py` を使い、  
+**同一の work_id に対して inference を2回連続**で投げて通るか確認します。
 
 ---
 
-## 9. 注意事項
+## 9. Soft-Prefix 注入の比較（非ストリーム出力で）
 
-- `/usr/local/m5stack/lib/gcc-10.3/libstdc++.so.6` のような **システム寄りの領域**を書き換える場合は、必ずバックアップを取ってください。
-- `ldconfig` 変更はシステム全体に影響します。影響範囲を理解した上で実施してください。
-- soft-prefix の注入が効いていない（出力が baseline と完全一致）場合は、LLMユニット側で **prefix合成が有効になっているか**（JSON受理→bf16復元→埋め込み先頭に合成）を確認してください。
+### 9.1 方針（推奨）
+
+- 入力：`llm.utf-8.stream`（dataに `delta/index/finish` を含めやすい）
+- 出力：`llm.utf-8`（一括で受け取って比較しやすい）
+
+### 9.2 比較スクリプト
+
+`scripts/compare_baseline_vs_softprefix_nostream.py` で、
+- baseline（prefixなし）
+- prefixあり（val小→大）
+を複数回回して、応答テキストを保存・比較します。
+
+---
+
+## 10. よくあるエラーと原因
+
+### `unit call false (-9)`（setup失敗）
+- `llm_llm-*` が起動できない（依存ライブラリ不整合）
+- `ldd /opt/m5stack/bin/llm_llm-*` を見て `GLIBCXX / libax_interpreter` を解消
+
+### `inference data push false (-4)`
+- setup が通っていない / 入力形式が合っていない / タスクが作れてない
+
+### 2回目だけタイムアウト
+- prefill固定長入力の未初期化や状態引きずりが原因になりやすい  
+  → `LLM.hpp` で **prefill入力のゼロ埋め**、`indices` の全埋めを必ず行う
+
+---
+
+## 11. 注意
+
+- `/usr/local/m5stack/lib/...` 配下の変更はシステム全体に影響します。必ずバックアップを取ってください。
+- まずは **非ストリーム**で安定動作を確認してから、ストリーム再挑戦をおすすめします。
 
 ---
 
 ## License
-todo
+この README は自由に改変・再配布してOKです（プロジェクト本体のライセンスに従ってください）。
