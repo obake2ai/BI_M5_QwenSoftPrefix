@@ -330,4 +330,4 @@ grep -n ""tokens_embed_size"" /opt/m5stack/data/models/mode_qwen2.5-0.5B-prefill
 ---
 
 ## License
-この README 自体は自由に改変・再配布してOKです（プロジェクト本体のライセンスに従ってください）。
+todo
