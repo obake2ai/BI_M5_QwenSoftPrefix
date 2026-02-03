@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 
 # ========= 設定 =========
-HOST = "192.168.3.132"
+HOST = "192.168.3.146"
 PORT = 10001
 
 MODEL = "qwen2.5-0.5B-prefill-20e"
