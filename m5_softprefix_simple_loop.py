@@ -388,7 +388,7 @@ def main() -> int:
     else:
         print(f"[INFO] soft_prefix: enabled P={args.softprefix_len} H={args.softprefix_h} val={args.softprefix_val}")
 
-    while:
+    while True:
         # ---- LLM ----
         with JSONLClient(args.llm_host, args.llm_port, args.llm_timeout, debug_skip=args.debug_skip) as cli:
             work_id = cli.setup(cfg)
