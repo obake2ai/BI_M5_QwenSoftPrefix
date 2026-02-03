@@ -388,12 +388,12 @@ def main() -> int:
     else:
         print(f"[INFO] soft_prefix: enabled P={args.softprefix_len} H={args.softprefix_h} val={args.softprefix_val}")
 
-    while True:
-        # ---- LLM ----
-        with JSONLClient(args.llm_host, args.llm_port, args.llm_timeout, debug_skip=args.debug_skip) as cli:
-            work_id = cli.setup(cfg)
-            print(f"[INFO] work_id={work_id}")
+    # ---- LLM ----
+    with JSONLClient(args.llm_host, args.llm_port, args.llm_timeout, debug_skip=args.debug_skip) as cli:
+        work_id = cli.setup(cfg)
+        print(f"[INFO] work_id={work_id}")
 
+        while True:
             t0 = time.time()
             out_text = cli.inference(
                 work_id=work_id,
@@ -410,32 +410,34 @@ def main() -> int:
             print("================================")
             print(f"[INFO] inference time: {dt:.2f}s\n")
 
-            # optional
-            cli.exit(work_id)
+            # ---- TTS ----
+            raw_path = Path(args.out_raw)
+            play_path = Path(args.out_play)
 
-        if args.no_tts:
-            print("[INFO] --no-tts specified. Done.")
-            #return 0
+            print(f"[INFO] TTS base={args.openai_base}")
+            print(f"[INFO] TTS model={args.tts_model} speed={args.tts_speed}")
+            print(f"[INFO] Writing wav: {raw_path}")
+            tts_generate_wav(args.openai_base, args.tts_model, out_text, raw_path, float(args.tts_speed))
 
-        # ---- TTS ----
-        raw_path = Path(args.out_raw)
-        play_path = Path(args.out_play)
+            print(f"[INFO] Converting for tinyplay: {play_path}")
+            ffmpeg_convert_for_tinyplay(raw_path, play_path, ar_hz=32000, channels=2, sample_fmt="s16")
 
-        print(f"[INFO] TTS base={args.openai_base}")
-        print(f"[INFO] TTS model={args.tts_model} speed={args.tts_speed}")
-        print(f"[INFO] Writing wav: {raw_path}")
-        tts_generate_wav(args.openai_base, args.tts_model, out_text, raw_path, float(args.tts_speed))
+            if args.no_play:
+                print("[INFO] --no-play specified. Done.")
+                #return 0
 
-        print(f"[INFO] Converting for tinyplay: {play_path}")
-        ffmpeg_convert_for_tinyplay(raw_path, play_path, ar_hz=32000, channels=2, sample_fmt="s16")
+            print(f"[INFO] tinyplay: card={args.tinyplay_card}, device={args.tinyplay_device}")
+            tinyplay_play(play_path, card=int(args.tinyplay_card), device=int(args.tinyplay_device))
 
-        if args.no_play:
-            print("[INFO] --no-play specified. Done.")
-            #return 0
+        # optional
+        cli.exit(work_id)
 
-        print(f"[INFO] tinyplay: card={args.tinyplay_card}, device={args.tinyplay_device}")
-        tinyplay_play(play_path, card=int(args.tinyplay_card), device=int(args.tinyplay_device))
+    if args.no_tts:
+        print("[INFO] --no-tts specified. Done.")
         #return 0
+
+
+    #return 0
 
 
 if __name__ == "__main__":
