@@ -322,8 +322,8 @@ def main():
                     channels=2,
                     sample_fmt="s16",
                 )
-            print(f"[INFO] tinyplay: card={args.tinyplay_card}, device={args.tinyplay_device}")
-            tinyplay_play(play_path, card=args.tinyplay_card, device=args.tinyplay_device)
+                print(f"[INFO] tinyplay: card={args.tinyplay_card}, device={args.tinyplay_device}")
+                tinyplay_play(play_path, card=args.tinyplay_card, device=args.tinyplay_device)
 
             else:
                 print("[INFO] --no-play specified. Done.")
