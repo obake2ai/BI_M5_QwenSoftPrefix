@@ -233,6 +233,17 @@ def unified_diff_head(a: str, b: str, n_lines: int = 80) -> str:
 
 
 def main():
+    ap = argparse.ArgumentParser(description="LLM (SoftPrefix) -> TTS wav -> ffmpeg -> tinyplay test on M5Stack Module LLM")
+    ap.add_argument("--openai-base", default="http://127.0.0.1:8000/v1", help="OpenAI-compatible base_url (default on-device)")
+    ap.add_argument("--tts-model", default="melotts-ja-jp", help="TTS model id (e.g. melotts-ja-jp)")
+    ap.add_argument("--tts-speed", type=float, default=1.0, help="TTS speed (default 1.0)")
+    ap.add_argument("--no-play", action="store_true", help="Do not run tinyplay")
+
+    ap.add_argument("--out-raw", default="/tmp/llm_tts_raw.wav", help="Output raw wav path")
+    ap.add_argument("--out-play", default="/tmp/llm_tts_32k_stereo_s16.wav", help="Output converted wav path for tinyplay")
+    raw_path = Path(args.out_raw)
+    play_path = Path(args.out_play)
+
     results: List[CaseResult] = []
 
     with LLMClient(HOST, PORT, SOCK_TIMEOUT_SEC) as cli:
@@ -290,6 +301,34 @@ def main():
             else:
                 print("--- diff(head) --- (no diff in head)")
             print("")
+
+            # --- TTS ---
+            if not args.no_play::
+                print(f"[INFO] TTS model: {args.tts_model}")
+                print(f"[INFO] Writing wav: {raw_path}")
+                tts_generate_wav(
+                    base_url=args.openai_base,
+                    model_id=args.tts_model,
+                    text=out,
+                    out_wav_path=raw_path,
+                    speed=args.tts_speed,
+                )
+
+                print(f"[INFO] Converting for tinyplay: {play_path}")
+                ffmpeg_convert_for_tinyplay(
+                    in_wav=raw_path,
+                    out_wav=play_path,
+                    ar_hz=32000,
+                    channels=2,
+                    sample_fmt="s16",
+                )
+            print(f"[INFO] tinyplay: card={args.tinyplay_card}, device={args.tinyplay_device}")
+            tinyplay_play(play_path, card=args.tinyplay_card, device=args.tinyplay_device)
+
+            else:
+                print("[INFO] --no-play specified. Done.")
+                return 0
+
 
         # 終了
         cli.exit(work_id)
