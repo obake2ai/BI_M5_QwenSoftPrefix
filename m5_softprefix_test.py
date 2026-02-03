@@ -8,6 +8,7 @@ import struct
 import time
 import difflib
 import hashlib
+import argparse
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, List, Tuple
 
