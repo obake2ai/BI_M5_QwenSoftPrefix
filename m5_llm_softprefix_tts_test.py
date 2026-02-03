@@ -4,105 +4,160 @@
 """
 M5Stack Module LLM (Linux) integration test:
 - LLM via StackFlow llm-sys TCP socket (default 127.0.0.1:10001)
-  * JSON frame = 10-byte length header + UTF-8 JSON body  (see docs/notes)  :contentReference[oaicite:2]{index=2}
-  * llm.setup / llm.inference message formats follow M5Stack StackFlow API docs :contentReference[oaicite:3]{index=3}
+  * Frame: 10-byte length header + UTF-8 JSON body (TCP framing)
 - TTS via OpenAI-compatible API (default http://127.0.0.1:8000/v1)
-  * POST /v1/audio/speech returns audio (wav) :contentReference[oaicite:4]{index=4}
+  * POST /v1/audio/speech returns audio (wav)
 
-SoftPrefix injection:
-- This script sends a "softprefix val" in multiple candidate keys.
-  Adjust keys to match your patched llm_framework if needed.
+Fix for MemoryError:
+- Robust framed receiver with:
+  * max frame size guard
+  * buffered resync (shift by 1 byte until a valid header+JSON body is found)
+  * recv() chunk size cap
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
 import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
 
 # -----------------------------
-# TCP framing helpers (llm-sys)
+# Robust TCP framing (llm-sys)
 # -----------------------------
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise EOFError("socket closed")
-        buf.extend(chunk)
-    return bytes(buf)
+DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024        # 8MB: plenty for lsmode etc, prevents runaway
+DEFAULT_MAX_BUFFER_BYTES = 16 * 1024 * 1024      # buffer cap for resync safety
+SOCK_RECV_CHUNK = 4096                           # per recv() read size
 
 
-def _read_len10(sock: socket.socket, max_resync: int = 1024) -> int:
+def _parse_len10_header(hdr10: bytes, max_frame_bytes: int) -> Optional[int]:
     """
-    Read 10-byte ASCII length header.
-    Most implementations use 10-digit decimal (zero-padded).
-    If we hit a stray newline/garbage, we try to resync by shifting 1 byte.
+    Parse 10-byte ASCII length header.
+    Some firmwares may pad with spaces/NUL; accept strip() variants.
+    Return None if invalid/out-of-range.
     """
-    hdr = bytearray(_recv_exact(sock, 10))
-    # Fast path
     try:
-        s = bytes(hdr).decode("utf-8")
-        if s.isdigit():
-            return int(s)
-    except Exception:
-        pass
+        s = hdr10.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
-    # Resync: shift until header becomes 10 digits
-    for _ in range(max_resync):
-        hdr.pop(0)
-        hdr.extend(_recv_exact(sock, 1))
-        try:
-            s = bytes(hdr).decode("utf-8")
-            if s.isdigit():
-                return int(s)
-        except Exception:
-            continue
+    s2 = s.strip("\x00 \r\n\t")
+    if not s2.isdigit():
+        return None
 
-    raise ValueError(f"Failed to parse/resync 10-byte length header: {bytes(hdr)!r}")
-
-
-def send_frame(sock: socket.socket, obj: Dict[str, Any]) -> None:
-    body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    header = f"{len(body):010d}".encode("utf-8")
-    sock.sendall(header + body)
-
-
-def recv_frame(sock: socket.socket, timeout_s: float) -> Dict[str, Any]:
-    sock.settimeout(timeout_s)
-    n = _read_len10(sock)
-    body = _recv_exact(sock, n)
     try:
-        return json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"JSON decode failed: {e} / body={body[:200]!r}...") from e
+        n = int(s2)
+    except ValueError:
+        return None
+
+    if n < 0 or n > max_frame_bytes:
+        return None
+
+    return n
 
 
-def recv_until(
-    sock: socket.socket,
-    predicate,
-    timeout_total_s: float,
-    per_read_timeout_s: float = 5.0
-) -> Dict[str, Any]:
-    deadline = time.time() + timeout_total_s
-    while True:
-        remain = deadline - time.time()
-        if remain <= 0:
-            raise TimeoutError("Timed out waiting for expected response")
-        msg = recv_frame(sock, timeout_s=min(per_read_timeout_s, remain))
-        if predicate(msg):
-            return msg
+@dataclass
+class Len10JsonFramedSocket:
+    """
+    Buffered framed JSON receiver:
+    - keeps rxbuf across reads
+    - tries to resync by shifting 1 byte when header/body is not plausible
+    """
+    sock: socket.socket
+    max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES
+    max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES
+    debug: bool = False
+    rxbuf: bytearray = field(default_factory=bytearray)
+
+    def send_json(self, obj: Dict[str, Any]) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        header = f"{len(body):010d}".encode("utf-8")
+        self.sock.sendall(header + body)
+
+    def recv_json(self, timeout_s: float) -> Dict[str, Any]:
+        """
+        Receive one JSON object (dict) framed as len10 + json.
+        Raises TimeoutError/EOFError on failure.
+        """
+        deadline = time.time() + timeout_s
+
+        while True:
+            parsed = self._try_parse_one()
+            if parsed is not None:
+                return parsed
+
+            remain = deadline - time.time()
+            if remain <= 0:
+                raise TimeoutError("Timed out waiting for a framed JSON response")
+
+            self.sock.settimeout(min(2.0, remain))
+            chunk = self.sock.recv(SOCK_RECV_CHUNK)
+            if not chunk:
+                raise EOFError("socket closed")
+
+            self.rxbuf.extend(chunk)
+
+            # Prevent runaway buffer growth if something goes very wrong
+            if len(self.rxbuf) > self.max_buffer_bytes:
+                drop = len(self.rxbuf) - self.max_buffer_bytes
+                if self.debug:
+                    print(f"[DEBUG] rxbuf overflow: drop {drop} bytes", file=sys.stderr)
+                del self.rxbuf[:drop]
+
+    def _try_parse_one(self) -> Optional[Dict[str, Any]]:
+        """
+        Try to parse one frame from rxbuf.
+        If frame candidate fails (bad header / bad JSON), shift by 1 byte and retry.
+        Returns dict on success, None if not enough bytes.
+        """
+        while len(self.rxbuf) >= 10:
+            hdr = bytes(self.rxbuf[:10])
+            n = _parse_len10_header(hdr, self.max_frame_bytes)
+            if n is None:
+                if self.debug:
+                    # show a compact view of the bad header
+                    try:
+                        hs = hdr.decode("utf-8", errors="replace")
+                    except Exception:
+                        hs = repr(hdr)
+                    print(f"[DEBUG] bad header -> shift 1 byte | hdr={hs!r} raw={hdr!r}", file=sys.stderr)
+                del self.rxbuf[:1]
+                continue
+
+            if len(self.rxbuf) < 10 + n:
+                return None  # need more data
+
+            body = bytes(self.rxbuf[10:10 + n])
+
+            # Try JSON decode WITHOUT consuming; on failure, resync by shifting 1 byte.
+            try:
+                obj = json.loads(body.decode("utf-8"))
+            except Exception as e:
+                if self.debug:
+                    preview = body[:80]
+                    print(f"[DEBUG] JSON decode failed -> shift 1 byte | n={n} err={e} body[:80]={preview!r}",
+                          file=sys.stderr)
+                del self.rxbuf[:1]
+                continue
+
+            if not isinstance(obj, dict):
+                # Protocol should be an object; if not, wrap it (keeps robustness).
+                obj = {"_json": obj}
+
+            # Consume frame on success
+            del self.rxbuf[:10 + n]
+            return obj
+
+        return None
 
 
 # -----------------------------
@@ -113,25 +168,46 @@ def recv_until(
 class LLMSetupConfig:
     model: str
     system_prompt: str
-    response_format: str = "llm.utf-8"         # non-stream output (easy to compare) :contentReference[oaicite:5]{index=5}
-    input_format: str = "llm.utf-8.stream"     # stream input (delta/index/finish + extra fields) :contentReference[oaicite:6]{index=6}
+    response_format: str = "llm.utf-8"         # non-stream output
+    input_format: str = "llm.utf-8.stream"     # stream input
     max_token_len: int = 256
     enoutput: bool = False
     enkws: bool = False
 
 
 class StackFlowClient:
-    def __init__(self, host: str, port: int, timeout_s: float = 5.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout_s: float = 5.0,
+        max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+        debug_frame: bool = False,
+    ) -> None:
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
+        self.max_frame_bytes = max_frame_bytes
+        self.debug_frame = debug_frame
+
         self.sock: Optional[socket.socket] = None
+        self.fsock: Optional[Len10JsonFramedSocket] = None
 
     def connect(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(self.timeout_s)
+        # reduce latency for small frames
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         s.connect((self.host, self.port))
         self.sock = s
+        self.fsock = Len10JsonFramedSocket(
+            sock=s,
+            max_frame_bytes=self.max_frame_bytes,
+            debug=self.debug_frame,
+        )
 
     def close(self) -> None:
         if self.sock:
@@ -139,11 +215,22 @@ class StackFlowClient:
                 self.sock.close()
             finally:
                 self.sock = None
+                self.fsock = None
 
-    def _must_sock(self) -> socket.socket:
-        if not self.sock:
+    def _must_fsock(self) -> Len10JsonFramedSocket:
+        if not self.fsock:
             raise RuntimeError("Not connected")
-        return self.sock
+        return self.fsock
+
+    def _recv_until(self, predicate, timeout_total_s: float, per_read_timeout_s: float = 5.0) -> Dict[str, Any]:
+        deadline = time.time() + timeout_total_s
+        while True:
+            remain = deadline - time.time()
+            if remain <= 0:
+                raise TimeoutError("Timed out waiting for expected response")
+            msg = self._must_fsock().recv_json(timeout_s=min(per_read_timeout_s, remain))
+            if predicate(msg):
+                return msg
 
     def sys_ping(self) -> Dict[str, Any]:
         req = {
@@ -153,9 +240,8 @@ class StackFlowClient:
             "object": "None",
             "data": "None",
         }
-        send_frame(self._must_sock(), req)
-        return recv_until(
-            self._must_sock(),
+        self._must_fsock().send_json(req)
+        return self._recv_until(
             lambda m: m.get("request_id") == "sys_ping" and m.get("work_id") == "sys",
             timeout_total_s=5.0,
         )
@@ -168,16 +254,15 @@ class StackFlowClient:
             "object": "None",
             "data": "None",
         }
-        send_frame(self._must_sock(), req)
-        resp = recv_until(
-            self._must_sock(),
+        self._must_fsock().send_json(req)
+        resp = self._recv_until(
             lambda m: m.get("request_id") == "sys_lsmode" and m.get("work_id") == "sys",
             timeout_total_s=10.0,
         )
         data = resp.get("data", [])
-        if not isinstance(data, list):
-            return []
-        return data
+        if isinstance(data, list):
+            return data
+        return []
 
     def llm_setup(self, cfg: LLMSetupConfig) -> str:
         """
@@ -199,10 +284,9 @@ class StackFlowClient:
                 "prompt": cfg.system_prompt,
             },
         }
-        send_frame(self._must_sock(), req)
+        self._must_fsock().send_json(req)
 
-        resp = recv_until(
-            self._must_sock(),
+        resp = self._recv_until(
             lambda m: m.get("request_id") == req_id and str(m.get("work_id", "")).startswith("llm."),
             timeout_total_s=30.0,
         )
@@ -235,14 +319,14 @@ class StackFlowClient:
         }
 
         # --- SoftPrefix injection: send multiple candidate keys ---
-        # Adjust this block to match your patched llm_framework key names.
         if softprefix_val is not None:
+            v = float(softprefix_val)
             data_obj.update({
-                "soft_prefix_val": float(softprefix_val),
-                "softprefix_val": float(softprefix_val),
-                "prefix_val": float(softprefix_val),
-                "test_embed_val": float(softprefix_val),
-                "soft_prefix": {"val": float(softprefix_val)},
+                "soft_prefix_val": v,
+                "softprefix_val": v,
+                "prefix_val": v,
+                "test_embed_val": v,
+                "soft_prefix": {"val": v},
                 "enable_soft_prefix": True,
             })
 
@@ -254,10 +338,8 @@ class StackFlowClient:
             "data": data_obj,
         }
 
-        send_frame(self._must_sock(), req)
+        self._must_fsock().send_json(req)
 
-        # Many implementations first send an "ack" (data push ok) then later the generation result.
-        # We'll collect responses for this work_id until finish or a full string arrives.
         out_chunks: List[str] = []
         deadline = time.time() + timeout_total_s
 
@@ -266,9 +348,10 @@ class StackFlowClient:
             if remain <= 0:
                 raise TimeoutError("Timed out waiting for LLM inference output")
 
-            msg = recv_frame(self._must_sock(), timeout_s=min(5.0, remain))
+            msg = self._must_fsock().recv_json(timeout_s=min(5.0, remain))
 
             if msg.get("work_id") != work_id:
+                # other unit messages; ignore
                 continue
 
             err = msg.get("error", {}) or {}
@@ -277,7 +360,7 @@ class StackFlowClient:
 
             data = msg.get("data")
 
-            # Non-stream output (recommended in your repo README) :contentReference[oaicite:7]{index=7}
+            # Non-stream output
             if isinstance(data, str):
                 out_chunks.append(data)
                 break
@@ -289,8 +372,6 @@ class StackFlowClient:
                     out_chunks.append(delta)
                 if data.get("finish") is True:
                     break
-
-            # Other messages: ignore
 
         return "".join(out_chunks).strip()
 
@@ -326,7 +407,6 @@ def tts_generate_wav(
     out_wav_path: Path,
     speed: float = 1.0,
 ) -> None:
-    # POST {base_url}/audio/speech
     url = base_url.rstrip("/") + "/audio/speech"
     payload = {
         "model": model_id,
@@ -369,7 +449,6 @@ def pick_model_by_preset(models: List[Dict[str, Any]], preset: str) -> Optional[
     """
     Try to pick an installed model name from sys.lsmode list.
     """
-    # sys.lsmode item may have keys: model / mode / id
     candidates: List[str] = []
     for it in models:
         for k in ("model", "mode", "id", "name"):
@@ -397,7 +476,7 @@ def pick_model_by_preset(models: List[Dict[str, Any]], preset: str) -> Optional[
 def main() -> int:
     ap = argparse.ArgumentParser(description="LLM (SoftPrefix) -> TTS wav -> ffmpeg -> tinyplay test on M5Stack Module LLM")
 
-    ap.add_argument("--llm-host", default="127.0.0.1", help="llm-sys host (on-device: 127.0.0.1, from PC: device IP or m5stack-LLM.local)")
+    ap.add_argument("--llm-host", default="127.0.0.1", help="llm-sys host (on-device: 127.0.0.1)")
     ap.add_argument("--llm-port", type=int, default=10001, help="llm-sys TCP port (default 10001)")
     ap.add_argument("--openai-base", default="http://127.0.0.1:8000/v1", help="OpenAI-compatible base_url (default on-device)")
 
@@ -411,7 +490,7 @@ def main() -> int:
 
     ap.add_argument("--softprefix-val", type=float, default=None, help="Enable SoftPrefix injection by sending this float value (e.g. 0.01). Omit for baseline.")
 
-    ap.add_argument("--tts-model", default="melotts-ja-jp", help="TTS model id (e.g. melotts-ja-jp) :contentReference[oaicite:8]{index=8}")
+    ap.add_argument("--tts-model", default="melotts-ja-jp", help="TTS model id (e.g. melotts-ja-jp)")
     ap.add_argument("--tts-speed", type=float, default=1.0, help="TTS speed (default 1.0)")
 
     ap.add_argument("--out-raw", default="/tmp/llm_tts_raw.wav", help="Output raw wav path")
@@ -421,32 +500,43 @@ def main() -> int:
     ap.add_argument("--tinyplay-card", type=int, default=0, help="tinyplay card number (default 0)")
     ap.add_argument("--tinyplay-device", type=int, default=1, help="tinyplay device number (default 1)")
 
+    # NEW: frame safety / debug
+    ap.add_argument("--max-frame-bytes", type=int, default=DEFAULT_MAX_FRAME_BYTES, help="Max TCP frame size for llm-sys (default 8MB)")
+    ap.add_argument("--debug-frame", action="store_true", help="Enable debug logs for TCP frame resync")
+
     args = ap.parse_args()
 
     raw_path = Path(args.out_raw)
     play_path = Path(args.out_play)
 
-    cli = StackFlowClient(args.llm_host, args.llm_port)
+    cli = StackFlowClient(
+        args.llm_host,
+        args.llm_port,
+        timeout_s=5.0,
+        max_frame_bytes=int(args.max_frame_bytes),
+        debug_frame=bool(args.debug_frame),
+    )
 
+    llm_text = ""
     try:
         cli.connect()
         ping = cli.sys_ping()
-        # ping response is mostly error.code==0 :contentReference[oaicite:9]{index=9}
         if (ping.get("error") or {}).get("code", 0) != 0:
             print(f"[WARN] sys.ping error: {ping}", file=sys.stderr)
 
         lsmode = cli.sys_lsmode()
+
         model_name = args.llm_model.strip()
         if not model_name:
             picked = pick_model_by_preset(lsmode, args.preset)
             if picked:
                 model_name = picked
             else:
-                # Fallback defaults from docs / common setup:
+                # fallback defaults
                 if args.preset == "qwen":
-                    model_name = "qwen2.5-0.5b"  # doc example :contentReference[oaicite:10]{index=10}
+                    model_name = "qwen2.5-0.5b"
                 else:
-                    model_name = "TinySwallow-1.5B-Instruct-ax630c"  # common mode name :contentReference[oaicite:11]{index=11}
+                    model_name = "TinySwallow-1.5B-Instruct-ax630c"
 
         print(f"[INFO] Using LLM model: {model_name}")
         if args.softprefix_val is None:
@@ -457,8 +547,8 @@ def main() -> int:
         cfg = LLMSetupConfig(
             model=model_name,
             system_prompt=args.system_prompt,
-            response_format="llm.utf-8",         # non-stream output (recommended in repo) :contentReference[oaicite:12]{index=12}
-            input_format="llm.utf-8.stream",     # stream input (delta/index/finish + softprefix fields) :contentReference[oaicite:13]{index=13}
+            response_format="llm.utf-8",
+            input_format="llm.utf-8.stream",
             max_token_len=args.max_token_len,
             enoutput=False,
             enkws=False,
@@ -481,7 +571,6 @@ def main() -> int:
         cli.close()
 
     # --- TTS ---
-    # Note: OpenAI-compatible API supports /v1/models and /v1/chat/completions etc :contentReference[oaicite:14]{index=14}
     print(f"[INFO] TTS model: {args.tts_model}")
     print(f"[INFO] Writing wav: {raw_path}")
     tts_generate_wav(
