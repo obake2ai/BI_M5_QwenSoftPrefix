@@ -2,19 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Simple M5Stack Module LLM (llm-sys) -> OpenAI-compatible TTS -> ffmpeg -> tinyplay
+Simple Module LLM (JSONL over TCP: newline-delimited JSON) -> (optional) OpenAI-compatible TTS -> ffmpeg -> tinyplay
 
-IMPORTANT:
-- llm-sys TCP(10001) framing in your environment is JSONL (newline-delimited JSON),
-  NOT "10-byte length header + JSON".
-- SoftPrefix is passed as:
-    data.soft_prefix = {"len": P, "data_b64": base64(bf16_le_u16 repeated P*H)}
+Added "clean system" behaviors:
+- Wait for llm.exit response (best-effort) and poll llm.taskinfo until 'deinit'
+- If llm.setup is stuck / times out / returns "already working", perform sys.reset and retry
+- Optional: --clean to sys.reset before and after every run
+- Robust socket close: shutdown() + close()
 
-This script keeps it minimal:
-- llm.setup
-- llm.inference (input: llm.utf-8.stream, response_format: llm.utf-8)
-- optional soft_prefix injection
-- optional TTS + convert + tinyplay
+Docs:
+- sys.reset exists (SYS unit).  llm.exit has a response and taskinfo can show 'deinit'.
 """
 
 from __future__ import annotations
@@ -31,7 +28,7 @@ import urllib.request
 import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 
 # -----------------------------
@@ -45,16 +42,133 @@ def f32_to_bf16_u16(x: float) -> int:
 
 
 def make_soft_prefix_b64_constant(P: int, H: int, val: float) -> str:
-    """
-    Build base64 of bf16 little-endian u16 repeated P*H times.
-    """
+    """base64 of bf16 little-endian u16 repeated P*H times."""
     u16 = f32_to_bf16_u16(val)
     raw = struct.pack("<H", u16) * (P * H)
     return base64.b64encode(raw).decode("ascii")
 
 
 # -----------------------------
-# JSONL socket client (LLM)
+# JSONL socket (no makefile)
+# -----------------------------
+
+class JSONLSocket:
+    """
+    Newline-delimited JSON over TCP.
+    Implemented with recv buffer (no socket.makefile) to avoid readline/timeout quirks.
+    """
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        connect_timeout_sec: float = 5.0,
+        io_timeout_sec: float = 1.0,
+        max_line_bytes: int = 2 * 1024 * 1024,  # 2MB safety
+        debug_skip: bool = False,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.connect_timeout_sec = connect_timeout_sec
+        self.io_timeout_sec = io_timeout_sec
+        self.max_line_bytes = max_line_bytes
+        self.debug_skip = debug_skip
+
+        self.sock: Optional[socket.socket] = None
+        self.rxbuf = bytearray()
+
+    def connect(self) -> None:
+        s = socket.create_connection((self.host, self.port), timeout=self.connect_timeout_sec)
+        s.settimeout(self.io_timeout_sec)
+        # optional: reduce latency
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        self.sock = s
+
+    def close(self) -> None:
+        if not self.sock:
+            return
+        try:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            self.sock.close()
+        finally:
+            self.sock = None
+            self.rxbuf.clear()
+
+    def send_json(self, obj: Dict[str, Any]) -> None:
+        if not self.sock:
+            raise RuntimeError("socket not connected")
+        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        self.sock.sendall(data)
+
+    def _recv_until_newline(self, deadline: float) -> Optional[bytes]:
+        """
+        Returns one line without trailing '\n'. None if deadline exceeded.
+        Raises RuntimeError on EOF.
+        """
+        while True:
+            nl = self.rxbuf.find(b"\n")
+            if nl != -1:
+                line = bytes(self.rxbuf[:nl])
+                del self.rxbuf[:nl + 1]
+                return line
+
+            if time.time() >= deadline:
+                return None
+
+            if not self.sock:
+                raise RuntimeError("socket not connected")
+
+            try:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError("socket closed (EOF)")
+                self.rxbuf.extend(chunk)
+                if len(self.rxbuf) > self.max_line_bytes:
+                    # avoid unbounded memory if server stops sending '\n'
+                    if self.debug_skip:
+                        print(f"[WARN] rxbuf too large ({len(self.rxbuf)} bytes), dropping buffer", file=sys.stderr)
+                    self.rxbuf.clear()
+            except socket.timeout:
+                # try again until deadline
+                continue
+
+    def read_json_line(self, deadline: float) -> Optional[Dict[str, Any]]:
+        """
+        Read and parse one JSON line by deadline.
+        - returns None if deadline exceeded
+        - returns {} for blank / non-JSON line (skipped)
+        """
+        raw = self._recv_until_newline(deadline)
+        if raw is None:
+            return None
+
+        s = raw.strip()
+        if not s:
+            return {}
+
+        try:
+            return json.loads(s.decode("utf-8"))
+        except Exception:
+            if self.debug_skip:
+                print(f"[SKIP NON-JSON] {raw[:200]!r}", file=sys.stderr)
+            return {}
+
+    def drain(self, duration_sec: float = 0.3) -> None:
+        """Best-effort: read and discard for a short time."""
+        end = time.time() + max(0.0, duration_sec)
+        while time.time() < end:
+            msg = self.read_json_line(deadline=time.time() + 0.05)
+            if msg is None:
+                break
+
+
+# -----------------------------
+# StackFlow API (subset)
 # -----------------------------
 
 @dataclass
@@ -68,101 +182,50 @@ class LLMSetupConfig:
     enkws: bool = False
 
 
-class JSONLClient:
-    """
-    Minimal JSONL (newline-delimited JSON) client.
-    Matches your working reference: sock.makefile + readline/write + '\n'
-    """
-    def __init__(self, host: str, port: int, sock_timeout_sec: int, debug_skip: bool = False):
-        self.host = host
-        self.port = port
-        self.sock_timeout_sec = sock_timeout_sec
-        self.debug_skip = debug_skip
+class StackFlow:
+    def __init__(self, jsock: JSONLSocket):
+        self.s = jsock
 
-        self.sock: Optional[socket.socket] = None
-        self.r = None
-        self.w = None
-
-    def __enter__(self):
-        self.sock = socket.create_connection((self.host, self.port), timeout=self.sock_timeout_sec)
-        self.sock.settimeout(self.sock_timeout_sec)
-        self.r = self.sock.makefile("r", encoding="utf-8", newline="\n")
-        self.w = self.sock.makefile("w", encoding="utf-8", newline="\n")
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            if self.w:
-                self.w.flush()
-        except Exception:
-            pass
-        try:
-            if self.r:
-                self.r.close()
-        except Exception:
-            pass
-        try:
-            if self.w:
-                self.w.close()
-        except Exception:
-            pass
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-
-    def send_json(self, obj: Dict[str, Any]) -> None:
-        self.w.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        self.w.flush()
-
-    def read_json_line(self) -> Optional[Dict[str, Any]]:
-        """
-        Read one JSON line.
-        Returns None on socket timeout (so wait loops can continue until global deadline).
-        """
-        try:
-            line = self.r.readline()
-        except (socket.timeout, OSError) as e:
-            # timed out -> let caller handle global timeout
-            if "timed out" in str(e).lower():
-                return None
-            raise
-
-        if line == "":
-            raise RuntimeError("socket closed (EOF)")
-
-        line = line.strip()
-        if not line:
-            return {}
-
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            # If server logs garbage lines, you can skip them.
-            if self.debug_skip:
-                print(f"[SKIP NON-JSON] {line!r}", file=sys.stderr)
-            return {}
-
-    def wait_for_request(self, request_id: str, max_wait_sec: int) -> Dict[str, Any]:
-        t0 = time.time()
+    def _wait_request(self, request_id: str, timeout_sec: float) -> Dict[str, Any]:
+        deadline = time.time() + timeout_sec
         while True:
-            if time.time() - t0 > max_wait_sec:
-                raise TimeoutError(f"timeout waiting response for request_id={request_id}")
-
-            msg = self.read_json_line()
+            msg = self.s.read_json_line(deadline=deadline)
             if msg is None:
-                continue
+                raise TimeoutError(f"timeout waiting response for request_id={request_id}")
             if not msg:
                 continue
-
             if msg.get("request_id") == request_id:
                 return msg
+            # otherwise skip
 
-            if self.debug_skip:
-                print(f"[SKIP] {msg}", file=sys.stderr)
+    # ---- SYS ----
 
-    def setup(self, cfg: LLMSetupConfig) -> str:
+    def sys_ping(self, timeout_sec: float = 5.0) -> Dict[str, Any]:
+        req_id = f"sys_ping_{int(time.time()*1000)}"
+        self.s.send_json({"request_id": req_id, "work_id": "sys", "action": "ping"})
+        return self._wait_request(req_id, timeout_sec)
+
+    def sys_reset(self, timeout_sec: float = 20.0) -> Optional[Dict[str, Any]]:
+        """
+        Reset unit. Connection may drop; treat EOF as success.
+        """
+        req_id = f"sys_reset_{int(time.time()*1000)}"
+        try:
+            self.s.send_json({"request_id": req_id, "work_id": "sys", "action": "reset"})
+        except Exception:
+            return None
+
+        try:
+            return self._wait_request(req_id, timeout_sec)
+        except RuntimeError:
+            # connection dropped (EOF) -> likely reset executed
+            return None
+        except TimeoutError:
+            return None
+
+    # ---- LLM ----
+
+    def llm_setup(self, cfg: LLMSetupConfig, timeout_sec: float = 60.0) -> Tuple[str, Dict[str, Any]]:
         req_id = f"setup_{int(time.time()*1000)}"
         req = {
             "request_id": req_id,
@@ -179,29 +242,23 @@ class JSONLClient:
                 "prompt": cfg.system_prompt,
             },
         }
-        self.send_json(req)
-        resp = self.wait_for_request(req_id, max_wait_sec=60)
-
-        err = resp.get("error", {}) or {}
-        if isinstance(err, dict) and err.get("code", 0) != 0:
-            raise RuntimeError(f"llm.setup failed: err={err} full={resp}")
-
+        self.s.send_json(req)
+        resp = self._wait_request(req_id, timeout_sec)
         work_id = resp.get("work_id")
-        if isinstance(work_id, str) and work_id:
-            return work_id
-        return "llm"
+        if not isinstance(work_id, str) or not work_id:
+            work_id = "llm"
+        return work_id, resp
 
-    def inference(
+    def llm_inference(
         self,
         work_id: str,
         user_prompt: str,
         input_object: str,
         soft_prefix_b64: Optional[str],
         soft_prefix_len: int,
-        max_wait_sec: int,
+        timeout_sec: float = 240.0,
     ) -> str:
         req_id = f"infer_{int(time.time()*1000)}"
-
         data_obj: Dict[str, Any] = {"delta": user_prompt, "index": 0, "finish": True}
         if soft_prefix_b64 is not None:
             data_obj["soft_prefix"] = {"len": int(soft_prefix_len), "data_b64": soft_prefix_b64}
@@ -210,28 +267,22 @@ class JSONLClient:
             "request_id": req_id,
             "work_id": work_id,
             "action": "inference",
-            "object": input_object,   # llm.utf-8.stream
+            "object": input_object,  # llm.utf-8.stream
             "data": data_obj,
         }
-        self.send_json(req)
+        self.s.send_json(req)
 
-        # response_format is non-stream, but just in case handle stream-ish dict too
-        t0 = time.time()
+        # non-stream expected, but handle stream-ish dict
+        deadline = time.time() + timeout_sec
         out_chunks: List[str] = []
 
         while True:
-            if time.time() - t0 > max_wait_sec:
-                raise TimeoutError(f"timeout waiting inference result request_id={req_id}")
-
-            msg = self.read_json_line()
+            msg = self.s.read_json_line(deadline=deadline)
             if msg is None:
-                continue
+                raise TimeoutError(f"timeout waiting inference result request_id={req_id}")
             if not msg:
                 continue
-
             if msg.get("request_id") != req_id:
-                if self.debug_skip:
-                    print(f"[SKIP] {msg}", file=sys.stderr)
                 continue
 
             err = msg.get("error", {}) or {}
@@ -239,11 +290,9 @@ class JSONLClient:
                 raise RuntimeError(f"llm.inference failed: err={err} full={msg}")
 
             data = msg.get("data")
-
             if isinstance(data, str):
                 out_chunks.append(data)
                 break
-
             if isinstance(data, dict):
                 d = data.get("delta")
                 if isinstance(d, str) and d:
@@ -251,14 +300,28 @@ class JSONLClient:
                 if data.get("finish") is True:
                     break
 
-            # otherwise keep waiting
-
         return "".join(out_chunks).strip()
 
-    def exit(self, work_id: str) -> None:
-        # exit response may or may not come; do not wait
+    def llm_taskinfo(self, work_id: str, timeout_sec: float = 5.0) -> Optional[Dict[str, Any]]:
+        req_id = f"taskinfo_{int(time.time()*1000)}"
+        self.s.send_json({"request_id": req_id, "work_id": work_id, "action": "taskinfo"})
+        try:
+            return self._wait_request(req_id, timeout_sec)
+        except Exception:
+            return None
+
+    def llm_exit(self, work_id: str, timeout_sec: float = 10.0) -> Optional[Dict[str, Any]]:
         req_id = f"exit_{int(time.time()*1000)}"
-        self.send_json({"request_id": req_id, "work_id": work_id, "action": "exit"})
+        try:
+            self.s.send_json({"request_id": req_id, "work_id": work_id, "action": "exit"})
+        except Exception:
+            return None
+
+        # llm.exit has a response in docs; wait best-effort.
+        try:
+            return self._wait_request(req_id, timeout_sec)
+        except Exception:
+            return None
 
 
 # -----------------------------
@@ -319,44 +382,62 @@ def tinyplay_play(wav_path: Path, card: int, device: int) -> None:
 
 def default_model_for_preset(preset: str) -> str:
     if preset == "qwen":
-        # match your working sample
         return "qwen2.5-0.5B-prefill-20e"
     if preset == "tinyswallow":
         return "TinySwallow-1.5B-Instruct-ax630c"
     return "qwen2.5-0.5B-prefill-20e"
 
 
+def is_already_working_error(resp: Dict[str, Any]) -> bool:
+    err = resp.get("error", {}) or {}
+    if isinstance(err, dict):
+        code = err.get("code", 0)
+        # docs: -13 "Module is already working"
+        return code == -13
+    return False
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Simple Module LLM -> TTS wav -> ffmpeg -> tinyplay (JSONL protocol)")
+    ap = argparse.ArgumentParser(description="Module LLM -> (optional) TTS -> tinyplay with clean shutdown/recovery")
 
-    ap.add_argument("--llm-host", default="127.0.0.1", help="llm-sys host (on-device: 127.0.0.1, from PC: device IP)")
-    ap.add_argument("--llm-port", type=int, default=10001, help="llm-sys TCP port (default 10001)")
-    ap.add_argument("--llm-timeout", type=int, default=240, help="socket timeout seconds (default 240)")
+    ap.add_argument("--llm-host", default="127.0.0.1")
+    ap.add_argument("--llm-port", type=int, default=10001)
 
+    # timeouts
+    ap.add_argument("--connect-timeout", type=float, default=5.0)
+    ap.add_argument("--io-timeout", type=float, default=1.0)
+    ap.add_argument("--setup-timeout", type=float, default=60.0)
+    ap.add_argument("--infer-timeout", type=float, default=240.0)
+    ap.add_argument("--exit-timeout", type=float, default=10.0)
+    ap.add_argument("--deinit-timeout", type=float, default=10.0)
+
+    # cleaning behavior
+    ap.add_argument("--clean", action="store_true", help="sys.reset before and after running (strong clean)")
+    ap.add_argument("--no-auto-reset", action="store_true", help="disable auto sys.reset on setup fail/timeout")
+    ap.add_argument("--debug-skip", action="store_true")
+
+    # model/prompt
     ap.add_argument("--preset", choices=["qwen", "tinyswallow"], default="qwen")
-    ap.add_argument("--llm-model", default="", help="override model name (if empty, use preset default)")
-
+    ap.add_argument("--llm-model", default="")
     ap.add_argument("--system-prompt", default="あなたは親切で簡潔な日本語アシスタントです。短く自然な日本語で答えてください。")
     ap.add_argument("--user", default="こんにちは。自己紹介を一文でお願いします。")
     ap.add_argument("--max-token-len", type=int, default=128)
 
-    # SoftPrefix (constant fill)
-    ap.add_argument("--softprefix-val", type=float, default=None, help="enable soft_prefix with constant value (e.g. 0.01)")
-    ap.add_argument("--softprefix-len", type=int, default=1, help="P: prefix token length (default 1)")
-    ap.add_argument("--softprefix-h", type=int, default=896, help="H: tokens_embed_size (default 896)")
+    # softprefix
+    ap.add_argument("--softprefix-val", type=float, default=None)
+    ap.add_argument("--softprefix-len", type=int, default=1)
+    ap.add_argument("--softprefix-h", type=int, default=896)
 
     # TTS
-    ap.add_argument("--openai-base", default="http://127.0.0.1:8000/v1", help="OpenAI-compatible base_url")
+    ap.add_argument("--openai-base", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--tts-model", default="melotts-ja-jp")
     ap.add_argument("--tts-speed", type=float, default=1.0)
     ap.add_argument("--out-raw", default="/tmp/llm_tts_raw.wav")
     ap.add_argument("--out-play", default="/tmp/llm_tts_32k_stereo_s16.wav")
-    ap.add_argument("--no-tts", action="store_true", help="skip TTS/ffmpeg/tinyplay (LLM only)")
-    ap.add_argument("--no-play", action="store_true", help="do not run tinyplay")
+    ap.add_argument("--no-tts", action="store_true")
+    ap.add_argument("--no-play", action="store_true")
     ap.add_argument("--tinyplay-card", type=int, default=0)
     ap.add_argument("--tinyplay-device", type=int, default=1)
-
-    ap.add_argument("--debug-skip", action="store_true", help="print skipped messages (stderr)")
 
     args = ap.parse_args()
 
@@ -365,8 +446,8 @@ def main() -> int:
     cfg = LLMSetupConfig(
         model=model_name,
         system_prompt=args.system_prompt,
-        response_format="llm.utf-8",        # non-stream output
-        input_object="llm.utf-8.stream",    # stream input (for soft_prefix)
+        response_format="llm.utf-8",
+        input_object="llm.utf-8.stream",
         max_token_len=int(args.max_token_len),
         enoutput=True,
         enkws=False,
@@ -374,7 +455,13 @@ def main() -> int:
 
     soft_b64: Optional[str] = None
     if args.softprefix_val is not None:
-        soft_b64 = make_soft_prefix_b64_constant(int(args.softprefix_len), int(args.softprefix_h), float(args.softprefix_val))
+        soft_b64 = make_soft_prefix_b64_constant(
+            int(args.softprefix_len),
+            int(args.softprefix_h),
+            float(args.softprefix_val),
+        )
+
+    auto_reset = not args.no_auto_reset
 
     print(f"[INFO] LLM host={args.llm_host}:{args.llm_port}")
     print(f"[INFO] model={cfg.model}")
@@ -384,19 +471,85 @@ def main() -> int:
     else:
         print(f"[INFO] soft_prefix: enabled P={args.softprefix_len} H={args.softprefix_h} val={args.softprefix_val}")
 
-    # ---- LLM ----
-    with JSONLClient(args.llm_host, args.llm_port, args.llm_timeout, debug_skip=args.debug_skip) as cli:
-        work_id = cli.setup(cfg)
+    out_text = ""
+    work_id: Optional[str] = None
+
+    js = JSONLSocket(
+        args.llm_host,
+        args.llm_port,
+        connect_timeout_sec=float(args.connect_timeout),
+        io_timeout_sec=float(args.io_timeout),
+        debug_skip=bool(args.debug_skip),
+    )
+
+    try:
+        print("[INFO] connecting...")
+        js.connect()
+        sf = StackFlow(js)
+        print("[INFO] connected")
+
+        # optional strong clean before
+        if args.clean:
+            print("[INFO] sys.reset (clean before)...")
+            sf.sys_reset(timeout_sec=20.0)
+            js.close()
+            time.sleep(1.0)
+            print("[INFO] reconnect after reset...")
+            js.connect()
+            sf = StackFlow(js)
+            print("[INFO] reconnected")
+
+        # ping (optional, but good sanity)
+        try:
+            sf.sys_ping(timeout_sec=5.0)
+        except Exception:
+            pass
+
+        # ---- setup with recovery ----
+        def do_setup_once() -> Tuple[str, Dict[str, Any]]:
+            return sf.llm_setup(cfg, timeout_sec=float(args.setup_timeout))
+
+        try:
+            work_id, setup_resp = do_setup_once()
+        except TimeoutError:
+            if not auto_reset:
+                raise
+            print("[WARN] llm.setup timeout -> sys.reset and retry", file=sys.stderr)
+            sf.sys_reset(timeout_sec=20.0)
+            js.close()
+            time.sleep(1.0)
+            js.connect()
+            sf = StackFlow(js)
+            work_id, setup_resp = do_setup_once()
+
+        # if setup returned error: handle "already working" with reset
+        err = (setup_resp.get("error") or {})
+        if isinstance(err, dict) and err.get("code", 0) != 0:
+            if is_already_working_error(setup_resp) and auto_reset:
+                print("[WARN] Module already working -> sys.reset and retry", file=sys.stderr)
+                sf.sys_reset(timeout_sec=20.0)
+                js.close()
+                time.sleep(1.0)
+                js.connect()
+                sf = StackFlow(js)
+                work_id, setup_resp = do_setup_once()
+                err2 = (setup_resp.get("error") or {})
+                if isinstance(err2, dict) and err2.get("code", 0) != 0:
+                    raise RuntimeError(f"llm.setup failed after reset: {err2} full={setup_resp}")
+            else:
+                raise RuntimeError(f"llm.setup failed: {err} full={setup_resp}")
+
         print(f"[INFO] work_id={work_id}")
 
+        # ---- inference ----
         t0 = time.time()
-        out_text = cli.inference(
+        out_text = sf.llm_inference(
             work_id=work_id,
             user_prompt=args.user,
             input_object=cfg.input_object,
             soft_prefix_b64=soft_b64,
             soft_prefix_len=int(args.softprefix_len),
-            max_wait_sec=int(args.llm_timeout),
+            timeout_sec=float(args.infer_timeout),
         )
         dt = time.time() - t0
 
@@ -405,14 +558,48 @@ def main() -> int:
         print("================================")
         print(f"[INFO] inference time: {dt:.2f}s\n")
 
-        # optional
-        cli.exit(work_id)
+    finally:
+        # ---- always try to cleanup LLM work ----
+        if js.sock is not None:
+            try:
+                sf = StackFlow(js)
+                if work_id:
+                    print("[INFO] llm.exit (graceful)...")
+                    sf.llm_exit(work_id, timeout_sec=float(args.exit_timeout))
 
+                    # poll taskinfo until deinit (best-effort)
+                    end = time.time() + float(args.deinit_timeout)
+                    while time.time() < end:
+                        st = sf.llm_taskinfo(work_id, timeout_sec=3.0)
+                        if not st:
+                            break
+                        data = st.get("data")
+                        if data == "deinit":
+                            break
+                        # if server says "not working" etc, treat as released
+                        e = st.get("error", {}) or {}
+                        if isinstance(e, dict) and e.get("code") in (-14, -19):
+                            break
+                        time.sleep(0.2)
+
+                # optional strong clean after
+                if args.clean:
+                    print("[INFO] sys.reset (clean after)...")
+                    sf.sys_reset(timeout_sec=20.0)
+
+                # drain a little to avoid leaving unread responses
+                js.drain(0.3)
+            except Exception as e:
+                print(f"[WARN] cleanup error (ignored): {e}", file=sys.stderr)
+            finally:
+                js.close()
+                print("[INFO] socket closed")
+
+    # ---- TTS ----
     if args.no_tts:
         print("[INFO] --no-tts specified. Done.")
         return 0
 
-    # ---- TTS ----
     raw_path = Path(args.out_raw)
     play_path = Path(args.out_play)
 
