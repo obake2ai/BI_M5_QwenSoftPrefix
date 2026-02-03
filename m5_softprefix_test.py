@@ -243,6 +243,8 @@ def main():
 
     ap.add_argument("--out-raw", default="/tmp/llm_tts_raw.wav", help="Output raw wav path")
     ap.add_argument("--out-play", default="/tmp/llm_tts_32k_stereo_s16.wav", help="Output converted wav path for tinyplay")
+
+    args = ap.parse_args()
     raw_path = Path(args.out_raw)
     play_path = Path(args.out_play)
 
