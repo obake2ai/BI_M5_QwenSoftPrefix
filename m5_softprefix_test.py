@@ -303,7 +303,7 @@ def main():
             print("")
 
             # --- TTS ---
-            if not args.no_play::
+            if not args.no_play:
                 print(f"[INFO] TTS model: {args.tts_model}")
                 print(f"[INFO] Writing wav: {raw_path}")
                 tts_generate_wav(
