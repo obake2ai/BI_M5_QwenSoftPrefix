@@ -415,7 +415,7 @@ def main() -> int:
 
         if args.no_tts:
             print("[INFO] --no-tts specified. Done.")
-            return 0
+            #return 0
 
         # ---- TTS ----
         raw_path = Path(args.out_raw)
@@ -431,11 +431,11 @@ def main() -> int:
 
         if args.no_play:
             print("[INFO] --no-play specified. Done.")
-            return 0
+            #return 0
 
         print(f"[INFO] tinyplay: card={args.tinyplay_card}, device={args.tinyplay_device}")
         tinyplay_play(play_path, card=int(args.tinyplay_card), device=int(args.tinyplay_device))
-        return 0
+        #return 0
 
 
 if __name__ == "__main__":
