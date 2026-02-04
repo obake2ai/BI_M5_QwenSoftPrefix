@@ -4,14 +4,13 @@
 """
 Simple Module LLM (JSONL over TCP: newline-delimited JSON) -> (optional) OpenAI-compatible TTS -> ffmpeg -> tinyplay
 
-Added "clean system" behaviors:
-- Wait for llm.exit response (best-effort) and poll llm.taskinfo until 'deinit'
-- If llm.setup is stuck / times out / returns "already working", perform sys.reset and retry
-- Optional: --clean to sys.reset before and after every run
-- Robust socket close: shutdown() + close()
-
-Docs:
-- sys.reset exists (SYS unit).  llm.exit has a response and taskinfo can show 'deinit'.
+Changes (2026-02):
+- Start TTS/playback BEFORE LLM cleanup by default to reduce "text->audio" latency
+- Add --llm (alias of --preset) to choose qwen/tinyswallow
+- Auto-select softprefix hidden size (H) by preset when --softprefix-h is not given:
+    qwen: 896, tinyswallow: 1536
+- Add timing logs for TTS/ffmpeg/playback
+- Optional: --cleanup-before-tts to keep old behavior (cleanup first)
 """
 
 from __future__ import annotations
@@ -29,6 +28,22 @@ import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
+
+
+# -----------------------------
+# Presets (model + softprefix H)
+# -----------------------------
+
+LLM_PRESETS: Dict[str, Dict[str, Any]] = {
+    "qwen": {
+        "model": "qwen2.5-0.5B-prefill-20e",
+        "softprefix_h": 896,
+    },
+    "tinyswallow": {
+        "model": "TinySwallow-1.5B-Instruct-ax630c",
+        "softprefix_h": 1536,
+    },
+}
 
 
 # -----------------------------
@@ -272,7 +287,6 @@ class StackFlow:
         }
         self.s.send_json(req)
 
-        # non-stream expected, but handle stream-ish dict
         deadline = time.time() + timeout_sec
         out_chunks: List[str] = []
 
@@ -317,7 +331,6 @@ class StackFlow:
         except Exception:
             return None
 
-        # llm.exit has a response in docs; wait best-effort.
         try:
             return self._wait_request(req_id, timeout_sec)
         except Exception:
@@ -359,9 +372,18 @@ def tts_generate_wav(base_url: str, model_id: str, text: str, out_wav_path: Path
     out_wav_path.write_bytes(audio)
 
 
-def ffmpeg_convert_for_tinyplay(in_wav: Path, out_wav: Path, ar_hz: int, channels: int, sample_fmt: str) -> None:
-    cmd = [
-        "ffmpeg", "-y",
+def ffmpeg_convert_for_tinyplay(
+    in_wav: Path,
+    out_wav: Path,
+    ar_hz: int,
+    channels: int,
+    sample_fmt: str,
+    quiet: bool = True,
+) -> None:
+    cmd = ["ffmpeg", "-y"]
+    if quiet:
+        cmd += ["-hide_banner", "-loglevel", "error"]
+    cmd += [
         "-i", str(in_wav),
         "-ar", str(ar_hz),
         "-ac", str(channels),
@@ -377,16 +399,8 @@ def tinyplay_play(wav_path: Path, card: int, device: int) -> None:
 
 
 # -----------------------------
-# Main
+# Helpers
 # -----------------------------
-
-def default_model_for_preset(preset: str) -> str:
-    if preset == "qwen":
-        return "qwen2.5-0.5B-prefill-20e"
-    if preset == "tinyswallow":
-        return "TinySwallow-1.5B-Instruct-ax630c"
-    return "qwen2.5-0.5B-prefill-20e"
-
 
 def is_already_working_error(resp: Dict[str, Any]) -> bool:
     err = resp.get("error", {}) or {}
@@ -396,6 +410,49 @@ def is_already_working_error(resp: Dict[str, Any]) -> bool:
         return code == -13
     return False
 
+
+def cleanup_llm_best_effort(sf: StackFlow, js: JSONLSocket, work_id: Optional[str], args: argparse.Namespace) -> None:
+    """
+    Always try to cleanup LLM work.
+    NOTE: This may take time if waiting 'deinit'. We run it AFTER TTS by default.
+    """
+    if js.sock is None:
+        return
+    try:
+        if work_id:
+            print("[INFO] llm.exit (graceful)...")
+            sf.llm_exit(work_id, timeout_sec=float(args.exit_timeout))
+
+            # poll taskinfo until deinit (best-effort)
+            end = time.time() + float(args.deinit_timeout)
+            while time.time() < end:
+                st = sf.llm_taskinfo(work_id, timeout_sec=3.0)
+                if not st:
+                    break
+                data = st.get("data")
+                if data == "deinit":
+                    break
+                e = st.get("error", {}) or {}
+                if isinstance(e, dict) and e.get("code") in (-14, -19):
+                    break
+                time.sleep(0.2)
+
+        # optional strong clean after
+        if args.clean:
+            print("[INFO] sys.reset (clean after)...")
+            sf.sys_reset(timeout_sec=20.0)
+
+        js.drain(0.3)
+    except Exception as e:
+        print(f"[WARN] cleanup error (ignored): {e}", file=sys.stderr)
+    finally:
+        js.close()
+        print("[INFO] socket closed")
+
+
+# -----------------------------
+# Main
+# -----------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Module LLM -> (optional) TTS -> tinyplay with clean shutdown/recovery")
@@ -416,9 +473,22 @@ def main() -> int:
     ap.add_argument("--no-auto-reset", action="store_true", help="disable auto sys.reset on setup fail/timeout")
     ap.add_argument("--debug-skip", action="store_true")
 
+    # NEW: keep old order if needed
+    ap.add_argument(
+        "--cleanup-before-tts",
+        action="store_true",
+        help="(old behavior) do LLM cleanup BEFORE TTS/playback (slower text->audio)",
+    )
+
     # model/prompt
-    ap.add_argument("--preset", choices=["qwen", "tinyswallow"], default="qwen")
-    ap.add_argument("--llm-model", default="")
+    ap.add_argument(
+        "--llm", "--preset",
+        dest="preset",
+        choices=["qwen", "tinyswallow"],
+        default="qwen",
+        help="Select LLM preset (alias: --preset)",
+    )
+    ap.add_argument("--llm-model", default="", help="Override model name (takes precedence over --llm/--preset)")
     ap.add_argument("--system-prompt", default="あなたは親切で簡潔な日本語アシスタントです。短く自然な日本語で答えてください。")
     ap.add_argument("--user", default="こんにちは。自己紹介を一文でお願いします。")
     ap.add_argument("--max-token-len", type=int, default=128)
@@ -426,7 +496,7 @@ def main() -> int:
     # softprefix
     ap.add_argument("--softprefix-val", type=float, default=None)
     ap.add_argument("--softprefix-len", type=int, default=1)
-    ap.add_argument("--softprefix-h", type=int, default=896)
+    ap.add_argument("--softprefix-h", type=int, default=None, help="Hidden size H for softprefix. If omitted, auto by preset.")
 
     # TTS
     ap.add_argument("--openai-base", default="http://127.0.0.1:8000/v1")
@@ -438,10 +508,16 @@ def main() -> int:
     ap.add_argument("--no-play", action="store_true")
     ap.add_argument("--tinyplay-card", type=int, default=0)
     ap.add_argument("--tinyplay-device", type=int, default=1)
+    ap.add_argument("--ffmpeg-verbose", action="store_true", help="Show ffmpeg full logs (default: quiet)")
 
     args = ap.parse_args()
 
-    model_name = args.llm_model.strip() or default_model_for_preset(args.preset)
+    preset_info = LLM_PRESETS.get(args.preset, LLM_PRESETS["qwen"])
+    model_name = args.llm_model.strip() or str(preset_info["model"])
+
+    # auto softprefix H when omitted
+    if args.softprefix_h is None:
+        args.softprefix_h = int(preset_info["softprefix_h"])
 
     cfg = LLMSetupConfig(
         model=model_name,
@@ -464,7 +540,7 @@ def main() -> int:
     auto_reset = not args.no_auto_reset
 
     print(f"[INFO] LLM host={args.llm_host}:{args.llm_port}")
-    print(f"[INFO] model={cfg.model}")
+    print(f"[INFO] preset={args.preset}, model={cfg.model}")
     print(f"[INFO] response_format={cfg.response_format}, input_object={cfg.input_object}")
     if soft_b64 is None:
         print("[INFO] soft_prefix: disabled")
@@ -481,6 +557,47 @@ def main() -> int:
         io_timeout_sec=float(args.io_timeout),
         debug_skip=bool(args.debug_skip),
     )
+    sf: Optional[StackFlow] = None
+
+    def do_tts_and_play(text: str) -> None:
+        if args.no_tts:
+            print("[INFO] --no-tts specified. Done.")
+            return
+
+        raw_path = Path(args.out_raw)
+        play_path = Path(args.out_play)
+
+        print(f"[INFO] TTS base={args.openai_base}")
+        print(f"[INFO] TTS model={args.tts_model} speed={args.tts_speed}")
+        print(f"[INFO] Writing wav: {raw_path}")
+
+        t0 = time.time()
+        tts_generate_wav(args.openai_base, args.tts_model, text, raw_path, float(args.tts_speed))
+        t1 = time.time()
+        print(f"[INFO] TTS time: {t1 - t0:.2f}s")
+
+        print(f"[INFO] Converting for tinyplay: {play_path}")
+        t2 = time.time()
+        ffmpeg_convert_for_tinyplay(
+            raw_path,
+            play_path,
+            ar_hz=32000,
+            channels=2,
+            sample_fmt="s16",
+            quiet=(not args.ffmpeg_verbose),
+        )
+        t3 = time.time()
+        print(f"[INFO] ffmpeg convert time: {t3 - t2:.2f}s")
+
+        if args.no_play:
+            print("[INFO] --no-play specified. Done.")
+            return
+
+        print(f"[INFO] tinyplay: card={args.tinyplay_card}, device={args.tinyplay_device}")
+        t4 = time.time()
+        tinyplay_play(play_path, card=int(args.tinyplay_card), device=int(args.tinyplay_device))
+        t5 = time.time()
+        print(f"[INFO] playback call time: {t5 - t4:.2f}s")
 
     try:
         print("[INFO] connecting...")
@@ -499,7 +616,7 @@ def main() -> int:
             sf = StackFlow(js)
             print("[INFO] reconnected")
 
-        # ping (optional, but good sanity)
+        # ping (optional)
         try:
             sf.sys_ping(timeout_sec=5.0)
         except Exception:
@@ -507,6 +624,7 @@ def main() -> int:
 
         # ---- setup with recovery ----
         def do_setup_once() -> Tuple[str, Dict[str, Any]]:
+            assert sf is not None
             return sf.llm_setup(cfg, timeout_sec=float(args.setup_timeout))
 
         try:
@@ -515,6 +633,7 @@ def main() -> int:
             if not auto_reset:
                 raise
             print("[WARN] llm.setup timeout -> sys.reset and retry", file=sys.stderr)
+            assert sf is not None
             sf.sys_reset(timeout_sec=20.0)
             js.close()
             time.sleep(1.0)
@@ -522,11 +641,11 @@ def main() -> int:
             sf = StackFlow(js)
             work_id, setup_resp = do_setup_once()
 
-        # if setup returned error: handle "already working" with reset
         err = (setup_resp.get("error") or {})
         if isinstance(err, dict) and err.get("code", 0) != 0:
             if is_already_working_error(setup_resp) and auto_reset:
                 print("[WARN] Module already working -> sys.reset and retry", file=sys.stderr)
+                assert sf is not None
                 sf.sys_reset(timeout_sec=20.0)
                 js.close()
                 time.sleep(1.0)
@@ -543,6 +662,7 @@ def main() -> int:
 
         # ---- inference ----
         t0 = time.time()
+        assert sf is not None
         out_text = sf.llm_inference(
             work_id=work_id,
             user_prompt=args.user,
@@ -558,66 +678,23 @@ def main() -> int:
         print("================================")
         print(f"[INFO] inference time: {dt:.2f}s\n")
 
+        # ---- TTS/playback vs cleanup order ----
+        if args.cleanup_before_tts:
+            # old order (slower perceived latency)
+            cleanup_llm_best_effort(sf, js, work_id, args)
+            do_tts_and_play(out_text)
+        else:
+            # new order (faster perceived latency): play first, cleanup later
+            do_tts_and_play(out_text)
+            cleanup_llm_best_effort(sf, js, work_id, args)
+
+        return 0
+
     finally:
-        # ---- always try to cleanup LLM work ----
-        if js.sock is not None:
-            try:
-                sf = StackFlow(js)
-                if work_id:
-                    print("[INFO] llm.exit (graceful)...")
-                    sf.llm_exit(work_id, timeout_sec=float(args.exit_timeout))
-
-                    # poll taskinfo until deinit (best-effort)
-                    end = time.time() + float(args.deinit_timeout)
-                    while time.time() < end:
-                        st = sf.llm_taskinfo(work_id, timeout_sec=3.0)
-                        if not st:
-                            break
-                        data = st.get("data")
-                        if data == "deinit":
-                            break
-                        # if server says "not working" etc, treat as released
-                        e = st.get("error", {}) or {}
-                        if isinstance(e, dict) and e.get("code") in (-14, -19):
-                            break
-                        time.sleep(0.2)
-
-                # optional strong clean after
-                if args.clean:
-                    print("[INFO] sys.reset (clean after)...")
-                    sf.sys_reset(timeout_sec=20.0)
-
-                # drain a little to avoid leaving unread responses
-                js.drain(0.3)
-            except Exception as e:
-                print(f"[WARN] cleanup error (ignored): {e}", file=sys.stderr)
-            finally:
-                js.close()
-                print("[INFO] socket closed")
-
-    # ---- TTS ----
-    if args.no_tts:
-        print("[INFO] --no-tts specified. Done.")
-        return 0
-
-    raw_path = Path(args.out_raw)
-    play_path = Path(args.out_play)
-
-    print(f"[INFO] TTS base={args.openai_base}")
-    print(f"[INFO] TTS model={args.tts_model} speed={args.tts_speed}")
-    print(f"[INFO] Writing wav: {raw_path}")
-    tts_generate_wav(args.openai_base, args.tts_model, out_text, raw_path, float(args.tts_speed))
-
-    print(f"[INFO] Converting for tinyplay: {play_path}")
-    ffmpeg_convert_for_tinyplay(raw_path, play_path, ar_hz=32000, channels=2, sample_fmt="s16")
-
-    if args.no_play:
-        print("[INFO] --no-play specified. Done.")
-        return 0
-
-    print(f"[INFO] tinyplay: card={args.tinyplay_card}, device={args.tinyplay_device}")
-    tinyplay_play(play_path, card=int(args.tinyplay_card), device=int(args.tinyplay_device))
-    return 0
+        # If we already cleaned inside try (either order), js.sock will be None here.
+        # If an exception happened before cleanup, do best-effort cleanup here.
+        if sf is not None and js.sock is not None:
+            cleanup_llm_best_effort(sf, js, work_id, args)
 
 
 if __name__ == "__main__":
