@@ -63,6 +63,48 @@ def make_soft_prefix_b64_constant(P: int, H: int, val: float) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+def make_soft_prefix_b64_random_scaled( #植物センサーの入力
+    P: int,
+    H: int,
+    val: float,
+    *,
+    seed: int | None = None,
+    dist: str = "uniform",      # "uniform" | "normal"
+    low: float = -1.0,          # dist="uniform" の範囲
+    high: float = 1.0,
+    mean: float = 0.0,          # dist="normal" の平均
+    std: float = 1.0,           # dist="normal" の標準偏差
+) -> str:
+    """
+    base64 of bf16 little-endian u16 values (length P*H).
+    Generate random float32 r[i], compute x[i] = r[i] * val, then bf16(truncate).
+    """
+    n = P * H
+    rng = random.Random(seed)
+
+    raw = bytearray(2 * n)
+    off = 0
+
+    if dist == "uniform":
+        for _ in range(n):
+            r = rng.random() * (high - low) + low  # [low, high)
+            x = r * float(val)
+            u16 = f32_to_bf16_u16(x)
+            raw[off:off + 2] = struct.pack("<H", u16)
+            off += 2
+    elif dist == "normal":
+        for _ in range(n):
+            r = rng.gauss(mean, std)
+            x = r * float(val)
+            u16 = f32_to_bf16_u16(x)
+            raw[off:off + 2] = struct.pack("<H", u16)
+            off += 2
+    else:
+        raise ValueError("dist must be 'uniform' or 'normal'")
+
+    return base64.b64encode(raw).decode("ascii")
+
+
 # -----------------------------
 # JSONL socket (no makefile)
 # -----------------------------
@@ -532,11 +574,17 @@ def main() -> int:
 
     soft_b64: Optional[str] = None
     if args.softprefix_val is not None:
-        soft_b64 = make_soft_prefix_b64_constant(
-            int(args.softprefix_len),
-            int(args.softprefix_h),
-            float(args.softprefix_val),
-        )
+        # soft_b64 = make_soft_prefix_b64_constant(
+        #     int(args.softprefix_len),
+        #     int(args.softprefix_h),
+        #     float(args.softprefix_val),
+        # )
+        soft_b64 = make_soft_prefix_b64_random_scaled(
+            P=int(args.softprefix_len),
+            H=int(args.softprefix_h),
+            val=float(args.softprefix_val),
+            seed=-1,
+            dist="uniform")
 
     auto_reset = not args.no_auto_reset
 
