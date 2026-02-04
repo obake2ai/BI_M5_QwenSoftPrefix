@@ -491,7 +491,7 @@ def main() -> int:
     ap.add_argument("--llm-model", default="", help="Override model name (takes precedence over --llm/--preset)")
     ap.add_argument("--system-prompt", default="あなたは親切で簡潔な日本語アシスタントです。短く自然な日本語で答えてください。")
     ap.add_argument("--user", default="こんにちは。自己紹介を一文でお願いします。")
-    ap.add_argument("--max-token-len", type=int, default=128)
+    ap.add_argument("--max-token-len", type=int, default=32)
 
     # softprefix
     ap.add_argument("--softprefix-val", type=float, default=None)
