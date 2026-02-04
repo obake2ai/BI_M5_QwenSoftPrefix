@@ -535,7 +535,7 @@ def main() -> int:
     ap.add_argument("--llm-model", default="", help="Override model name (takes precedence over --llm/--preset)")
     ap.add_argument("--system-prompt", default="あなたは親切で簡潔な日本語アシスタントです。短く自然な日本語で答えてください。")
     ap.add_argument("--user", default="こんにちは。自己紹介を一文でお願いします。")
-    ap.add_argument("--max-token-len", type=int, default=32)
+    ap.add_argument("--max-token-len", type=int, default=64)
 
     # softprefix
     ap.add_argument("--softprefix-val", type=float, default=None)
@@ -545,7 +545,7 @@ def main() -> int:
     # TTS
     ap.add_argument("--openai-base", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--tts-model", default="melotts-ja-jp")
-    ap.add_argument("--tts-speed", type=float, default=1.0)
+    ap.add_argument("--tts-speed", type=float, default=0.5)
     ap.add_argument("--out-raw", default="/tmp/llm_tts_raw.wav")
     ap.add_argument("--out-play", default="/tmp/llm_tts_32k_stereo_s16.wav")
     ap.add_argument("--no-tts", action="store_true")
