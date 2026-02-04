@@ -277,6 +277,7 @@ class StackFlow:
         data_obj: Dict[str, Any] = {"delta": user_prompt, "index": 0, "finish": True}
         if soft_prefix_b64 is not None:
             data_obj["soft_prefix"] = {"len": int(soft_prefix_len), "data_b64": soft_prefix_b64}
+            print ("SoftPrefix: ", data_obj["soft_prefix"])
 
         req = {
             "request_id": req_id,
