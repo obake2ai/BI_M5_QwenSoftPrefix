@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 import random
 
+from m5_audio_sync import *
+
 
 # -----------------------------
 # Presets (model + softprefix H)
@@ -415,7 +417,6 @@ def tts_generate_wav(base_url: str, model_id: str, text: str, out_wav_path: Path
     audio = http_post_json(url, payload, timeout_s=120.0)
     out_wav_path.write_bytes(audio)
 
-
 def ffmpeg_convert_for_tinyplay(
     in_wav: Path,
     out_wav: Path,
@@ -435,6 +436,48 @@ def ffmpeg_convert_for_tinyplay(
         str(out_wav),
     ]
     subprocess.run(cmd, check=True)
+
+    rumble_layered_with_fx(
+        INPUT_WAV_16K,
+        out_r3,
+        pitch_steps=-16.0,
+        sub_oct_mix=0.55,
+        rumble_mix=0.25,
+        rumble_base_hz=55.0,
+        drive=0.55,
+        xover_hz=280.0
+    )
+
+def ffmpeg_convert_for_tinyplay_with_rumble(
+    in_wav: Path,
+    out_wav: Path,
+    ar_hz: int,
+    channels: int,
+    sample_fmt: str,
+    quiet: bool = True,
+) -> None:
+    cmd = ["ffmpeg", "-y"]
+    if quiet:
+        cmd += ["-hide_banner", "-loglevel", "error"]
+    cmd += [
+        "-i", str(in_wav),
+        "-ar", str(ar_hz),
+        "-ac", str(channels),
+        "-sample_fmt", sample_fmt,
+        str(out_wav),
+    ]
+    subprocess.run(cmd, check=True)
+
+    rumble_layered_with_fx(
+        out_wav,
+        out_wav,
+        pitch_steps=-16.0,
+        sub_oct_mix=0.55,
+        rumble_mix=0.25,
+        rumble_base_hz=55.0,
+        drive=0.55,
+        xover_hz=280.0
+    )
 
 
 def tinyplay_play(wav_path: Path, card: int, device: int) -> None:
@@ -545,7 +588,7 @@ def main() -> int:
     # TTS
     ap.add_argument("--openai-base", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--tts-model", default="melotts-ja-jp")
-    ap.add_argument("--tts-speed", type=float, default=0.5)
+    ap.add_argument("--tts-speed", type=float, default=1.0)
     ap.add_argument("--out-raw", default="/tmp/llm_tts_raw.wav")
     ap.add_argument("--out-play", default="/tmp/llm_tts_32k_stereo_s16.wav")
     ap.add_argument("--no-tts", action="store_true")
@@ -553,6 +596,7 @@ def main() -> int:
     ap.add_argument("--tinyplay-card", type=int, default=0)
     ap.add_argument("--tinyplay-device", type=int, default=1)
     ap.add_argument("--ffmpeg-verbose", action="store_true", help="Show ffmpeg full logs (default: quiet)")
+    ap.add_argument("--rumble", action="store_true", help="Activate rumble effects")
 
     args = ap.parse_args()
 
@@ -628,14 +672,24 @@ def main() -> int:
 
         print(f"[INFO] Converting for tinyplay: {play_path}")
         t2 = time.time()
-        ffmpeg_convert_for_tinyplay(
-            raw_path,
-            play_path,
-            ar_hz=32000,
-            channels=2,
-            sample_fmt="s16",
-            quiet=(not args.ffmpeg_verbose),
-        )
+        if args.rumble:
+            ffmpeg_convert_for_tinyplay_with_rumble(
+                raw_path,
+                play_path,
+                ar_hz=32000,
+                channels=2,
+                sample_fmt="s16",
+                quiet=(not args.ffmpeg_verbose),
+            )
+        else:
+            ffmpeg_convert_for_tinyplay(
+                raw_path,
+                play_path,
+                ar_hz=32000,
+                channels=2,
+                sample_fmt="s16",
+                quiet=(not args.ffmpeg_verbose),
+            )
         t3 = time.time()
         print(f"[INFO] ffmpeg convert time: {t3 - t2:.2f}s")
 
