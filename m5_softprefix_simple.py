@@ -437,17 +437,6 @@ def ffmpeg_convert_for_tinyplay(
     ]
     subprocess.run(cmd, check=True)
 
-    rumble_layered_with_fx(
-        INPUT_WAV_16K,
-        out_r3,
-        pitch_steps=-16.0,
-        sub_oct_mix=0.55,
-        rumble_mix=0.25,
-        rumble_base_hz=55.0,
-        drive=0.55,
-        xover_hz=280.0
-    )
-
 def ffmpeg_convert_for_tinyplay_with_rumble(
     in_wav: Path,
     out_wav: Path,
