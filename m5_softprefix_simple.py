@@ -192,7 +192,7 @@ class LLMSetupConfig:
     system_prompt: str
     response_format: str = "llm.utf-8"       # non-stream output
     input_object: str = "llm.utf-8.stream"  # stream input
-    max_token_len: int = 128
+    max_token_len: int = 32
     enoutput: bool = True
     enkws: bool = False
 
