@@ -229,6 +229,16 @@ def envelope_follower(x: np.ndarray,
     env = np.power(env, float(power)).astype(np.float32)
     return env
 
+def butter_filter(y: np.ndarray, sr: int, btype: str, cutoff, order: int = 4) -> np.ndarray:
+    b, a = signal.butter(order, cutoff, btype=btype, fs=sr)
+    return signal.lfilter(b, a, y).astype(np.float32)
+
+def tanh_drive(y: np.ndarray, drive: float) -> np.ndarray:
+    if drive <= 0:
+        return y.astype(np.float32)
+    k = 1.0 + float(drive) * 5.0
+    return np.tanh(k * y).astype(np.float32)
+
 def make_rumble_noise(voice: np.ndarray,
                       sr: int,
                       base_hz: float = 55.0,
