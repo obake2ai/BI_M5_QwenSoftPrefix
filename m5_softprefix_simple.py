@@ -683,7 +683,7 @@ def main() -> int:
             ffmpeg_convert_for_tinyplay_with_rumble(
                 raw_path,
                 play_path,
-                ar_hz=32000,
+                ar_hz=48000,
                 channels=2,
                 sample_fmt="s16",
                 quiet=(not args.ffmpeg_verbose),
