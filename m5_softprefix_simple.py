@@ -445,21 +445,26 @@ def ffmpeg_convert_for_tinyplay_with_rumble(
     sample_fmt: str,
     quiet: bool = True,
 ) -> None:
+    # 1) まず rumble 用に 16kHz mono の一時ファイルを作る
+    tmp16 = out_wav.with_suffix(".tmp16k_mono.wav")
+    tmpfx16 = out_wav.with_suffix(".tmp16k_mono_fx.wav")
+
     cmd = ["ffmpeg", "-y"]
     if quiet:
         cmd += ["-hide_banner", "-loglevel", "error"]
     cmd += [
         "-i", str(in_wav),
-        "-ar", str(ar_hz),
-        "-ac", str(channels),
-        "-sample_fmt", sample_fmt,
-        str(out_wav),
+        "-ac", "1",
+        "-ar", "16000",
+        "-sample_fmt", "s16",   # ここは固定でもOK（処理用）
+        str(tmp16),
     ]
     subprocess.run(cmd, check=True)
 
+    # 2) rumble + fx は 16k/mono のまま別ファイルに出す
     rumble_layered_with_fx(
-        out_wav,
-        out_wav,
+        str(tmp16),
+        str(tmpfx16),
         pitch_steps=-16.0,
         sub_oct_mix=0.55,
         rumble_mix=0.25,
@@ -467,6 +472,19 @@ def ffmpeg_convert_for_tinyplay_with_rumble(
         drive=0.55,
         xover_hz=280.0
     )
+
+    # 3) 最後に tinyplay 用フォーマットに変換（ここが “最終成果物”）
+    cmd = ["ffmpeg", "-y"]
+    if quiet:
+        cmd += ["-hide_banner", "-loglevel", "error"]
+    cmd += [
+        "-i", str(tmpfx16),
+        "-ar", str(ar_hz),
+        "-ac", str(channels),
+        "-sample_fmt", sample_fmt,
+        str(out_wav),
+    ]
+    subprocess.run(cmd, check=True)
 
 
 def tinyplay_play(wav_path: Path, card: int, device: int) -> None:
